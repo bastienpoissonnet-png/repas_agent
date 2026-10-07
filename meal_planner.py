@@ -1,12 +1,14 @@
 """Moteur de planification des repas et d'optimisation des courses étudiantes.
 
 Ce module applique les contraintes suivantes :
-1. Période : du Lundi soir au Vendredi midi (4 dîners + 4 déjeuners).
-2. Règle des tupperwares : chaque dîner cuisiné est doublé pour servir de déjeuner le lendemain.
-3. Priorité absolue aux restes et denrées du week-end (consommés dès le lundi/mardi).
-4. Sélection de recettes étudiantes économiques alignées sur les promotions Monoprix.
-5. Génération d'une liste de courses épurée (uniquement les ingrédients manquants),
-   triée par rayon avec mention des promotions.
+1. Planification dynamique : calcule les repas restants selon le jour actuel (datetime.now())
+   ou selon les indications de l'utilisateur (ex. Mercredi soir -> Vendredi midi).
+2. Règle des tupperwares : 1 dîner cuisiné le soir en double portion = le déjeuner du lendemain midi.
+3. Priorité absolue aux restes et denrées du week-end dès le premier créneau disponible.
+4. Stock de base permanent du placard : Riz et Pâtes sont considérés comme toujours en stock
+   chez l'étudiant et ne sont JAMAIS ajoutés à la liste de courses.
+5. Recettes ultra-simples et rapides : temps de préparation < 15 min, 1 seul ustensile,
+   ingrédients économiques et accessibles.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 
@@ -21,6 +24,13 @@ def _normalize_text(text: str) -> str:
     """Normalise une chaîne de texte (minuscules, sans accents) pour la comparaison."""
     text = unicodedata.normalize("NFKD", text).encode("ASCII", "ignore").decode("utf-8")
     return text.lower().strip()
+
+
+# Féculents et condiments toujours présents dans le placard de l'étudiant
+PANTRY_STAPLES_KEYWORDS = {
+    "riz", "basmati", "pates", "pâtes", "penne", "spaghetti",
+    "coquillettes", "tagliatelles", "nouilles", "sel", "poivre", "huile", "eau"
+}
 
 
 @dataclass
@@ -37,119 +47,135 @@ class Recipe:
     title: str
     ingredients: List[Ingredient]
     instructions_brief: str
-    prep_time_min: int = 20
+    prep_time_min: int = 10
+    utensils: str = "1 poêle"
     is_leftover_adaptation: bool = False
 
 
-# Bibliothèque de recettes étudiantes simples, rapides et économiques
+# Bibliothèque de recettes étudiantes express (< 15 min, 1 seul ustensile, très simple)
 RECIPE_CATALOG: List[Recipe] = [
     Recipe(
-        id="poulet_curry_riz",
-        title="Poêlée de poulet au curry doux, courgettes & riz basmati",
-        ingredients=[
-            Ingredient("Filets de poulet", "250g", "Boucherie & Volaille", ["poulet", "volaille", "escalope"]),
-            Ingredient("Courgettes fraîches", "2 pièces", "Fruits & Légumes", ["courgette", "courgettes"]),
-            Ingredient("Riz basmati", "150g", "Épicerie salée", ["riz", "basmati"]),
-            Ingredient("Crème fraîche", "10cl", "Crèmerie & Fromages", ["creme", "creme fraiche"]),
-        ],
-        instructions_brief="Faire dorer le poulet émincé avec les courgettes en dés, ajouter la crème et une pointe de curry, servir avec le riz.",
-        prep_time_min=20,
-    ),
-    Recipe(
-        id="poulet_poivrons_fajitas",
-        title="Poêlée mexicaine de poulet aux poivrons tricolores & riz",
+        id="poulet_curry_minute",
+        title="Poêlée express de poulet au curry & courgettes (sur riz)",
         ingredients=[
             Ingredient("Filets de poulet", "250g", "Boucherie & Volaille", ["filet de poulet", "poulet", "escalope"]),
-            Ingredient("Poivrons tricolores", "2 pièces", "Fruits & Légumes", ["poivron", "poivrons"]),
-            Ingredient("Riz basmati", "150g", "Épicerie salée", ["riz basmati", "riz"]),
-            Ingredient("Coulis de tomates", "150g", "Épicerie salée", ["coulis de tomates", "coulis"]),
+            Ingredient("Courgettes fraîches", "1 pièce", "Fruits & Légumes", ["courgette", "courgettes"]),
+            Ingredient("Crème fraîche", "10cl", "Crèmerie & Fromages", ["creme", "creme fraiche"]),
+            Ingredient("Riz basmati (placard)", "150g", "Épicerie salée", ["riz", "basmati"]),
         ],
-        instructions_brief="Saisir les poivrons émincés et le poulet à feu vif, mijoter 10 min avec le coulis, accompagner de riz.",
-        prep_time_min=20,
+        instructions_brief="Dorer le poulet émincé 5 min à la poêle avec les dés de courgette, lier à la crème et au curry. Servir sur le riz.",
+        prep_time_min=10,
+        utensils="1 poêle",
     ),
     Recipe(
-        id="saumon_brocolis_riz",
-        title="Pavés de saumon rôtis, brocolis vapeur & riz basmati",
+        id="penne_mozzarella_mutti",
+        title="Penne minute à la Mozzarella fondante & coulis Mutti",
+        ingredients=[
+            Ingredient("Coulis de tomates", "250g", "Épicerie salée", ["coulis de tomates", "coulis"]),
+            Ingredient("Mozzarella di Bufala", "1 boule (125g)", "Crèmerie & Fromages", ["mozzarella", "fromage"]),
+            Ingredient("Tomates cerises", "100g", "Fruits & Légumes", ["tomates cerises"]),
+            Ingredient("Penne Rigate (placard)", "200g", "Épicerie salée", ["penne", "pates"]),
+        ],
+        instructions_brief="Cuire les penne al dente, verser le coulis chaud avec les tomates cerises et la mozzarella coupée qui fond instantanément.",
+        prep_time_min=10,
+        utensils="1 casserole",
+    ),
+    Recipe(
+        id="saumon_poele_brocolis",
+        title="Pavé de saumon poêlé express & brocolis croquants (sur riz)",
         ingredients=[
             Ingredient("Pavés de saumon", "2 pièces", "Poissonnerie", ["saumon", "poisson"]),
-            Ingredient("Brocolis frais ou bio", "300g", "Fruits & Légumes", ["brocoli", "brocolis"]),
-            Ingredient("Riz basmati", "150g", "Épicerie salée", ["riz", "basmati"]),
-            Ingredient("Crème fraîche", "1 cuil. à soupe", "Crèmerie & Fromages", ["creme", "creme fraiche"]),
+            Ingredient("Brocolis frais ou bio", "250g", "Fruits & Légumes", ["brocoli", "brocolis"]),
+            Ingredient("Riz basmati (placard)", "150g", "Épicerie salée", ["riz", "basmati"]),
         ],
-        instructions_brief="Cuire les brocolis à la vapeur ou à l'eau, poêler les pavés de saumon 3-4 min par face, servir bien chaud.",
-        prep_time_min=15,
+        instructions_brief="Snacker le saumon 3 min par face à la poêle, cuire les fleurettes de brocolis 5 min dans l'eau bouillante et servir sur le riz.",
+        prep_time_min=10,
+        utensils="1 poêle",
     ),
     Recipe(
-        id="penne_saumon_creme",
-        title="Penne Rigate au saumon fondant et crème d'Isigny",
+        id="fajita_bowl_poulet",
+        title="Fajita-bowl rapide au poulet sauté & poivrons (sur riz)",
         ingredients=[
-            Ingredient("Pavés de saumon", "2 pièces", "Poissonnerie", ["saumon", "poisson"]),
-            Ingredient("Penne Rigate", "200g", "Épicerie salée", ["penne", "pates", "pasta"]),
-            Ingredient("Crème fraîche", "15cl", "Crèmerie & Fromages", ["creme", "creme fraiche"]),
+            Ingredient("Filets de poulet", "250g", "Boucherie & Volaille", ["filet de poulet", "poulet", "escalope"]),
+            Ingredient("Poivrons tricolores", "1 pièce", "Fruits & Légumes", ["poivron", "poivrons"]),
+            Ingredient("Coulis de tomates", "100g", "Épicerie salée", ["coulis de tomates", "coulis"]),
+            Ingredient("Riz basmati (placard)", "150g", "Épicerie salée", ["riz", "basmati"]),
         ],
-        instructions_brief="Cuire les pâtes al dente, émietter le saumon cuit à la poêle avec la crème et mélanger.",
-        prep_time_min=15,
+        instructions_brief="Saisir les lamelles de poulet et de poivron 6 min à feu vif, ajouter 2 cuillères de coulis et déposer sur le riz.",
+        prep_time_min=12,
+        utensils="1 poêle",
     ),
     Recipe(
-        id="dahl_lentilles_corail",
-        title="Dahl réconfortant de lentilles corail au lait de coco & riz",
-        ingredients=[
-            Ingredient("Lentilles corail", "200g", "Épicerie salée", ["lentilles", "lentille"]),
-            Ingredient("Lait de coco", "20cl", "Épicerie salée", ["coco", "lait de coco"]),
-            Ingredient("Coulis de tomates", "200g", "Épicerie salée", ["coulis", "tomates", "sauce tomate"]),
-            Ingredient("Riz basmati", "150g", "Épicerie salée", ["riz", "basmati"]),
-        ],
-        instructions_brief="Rincer les lentilles, cuire 15 min dans le coulis et le lait de coco avec épices douces, servir sur le riz.",
-        prep_time_min=20,
-    ),
-    Recipe(
-        id="chili_express",
-        title="Chili express au bœuf haché, tomates Mutti & riz",
+        id="hache_italien_penne",
+        title="Bœuf haché express façon bolognese & penne",
         ingredients=[
             Ingredient("Steaks hachés pur bœuf", "2 pièces (200g)", "Boucherie & Volaille", ["boeuf", "steak", "viande hachee"]),
-            Ingredient("Coulis de tomates", "250g", "Épicerie salée", ["coulis", "tomates"]),
-            Ingredient("Poivrons tricolores", "1 pièce", "Fruits & Légumes", ["poivron", "poivrons"]),
-            Ingredient("Riz basmati", "150g", "Épicerie salée", ["riz"]),
+            Ingredient("Coulis de tomates", "250g", "Épicerie salée", ["coulis de tomates", "coulis"]),
+            Ingredient("Penne Rigate (placard)", "200g", "Épicerie salée", ["penne", "pates"]),
         ],
-        instructions_brief="Émietter le bœuf dans une poêle chaude, ajouter les dés de poivron et le coulis, laisser réduire.",
-        prep_time_min=20,
-    ),
-    Recipe(
-        id="penne_mozzarella_tomates",
-        title="Gratin de Penne à la Mozzarella di Bufala et coulis Mutti",
-        ingredients=[
-            Ingredient("Penne Rigate", "200g", "Épicerie salée", ["penne", "pates"]),
-            Ingredient("Mozzarella di Bufala", "1 boule (125g)", "Crèmerie & Fromages", ["mozzarella", "fromage"]),
-            Ingredient("Coulis de tomates", "250g", "Épicerie salée", ["coulis", "tomates"]),
-            Ingredient("Tomates cerises", "100g", "Fruits & Légumes", ["tomates cerises", "tomate"]),
-        ],
-        instructions_brief="Mélanger pâtes cuites, coulis et tomates cerises, recouvrir de tranches de mozzarella et gratiner 10 min.",
-        prep_time_min=20,
+        instructions_brief="Émietter le steak haché 4 min dans la poêle, verser le coulis Mutti chaud et mélanger aux penne cuites.",
+        prep_time_min=10,
+        utensils="1 poêle",
     ),
     Recipe(
         id="poelee_champignons_oeufs",
-        title="Poêlée campagnarde de champignons, courgettes & œufs au plat",
+        title="Poêlée minute de champignons dorés & œufs au plat",
         ingredients=[
-            Ingredient("Champignons de Paris", "250g", "Fruits & Légumes", ["champignon", "champignons"]),
-            Ingredient("Courgettes fraîches", "1 pièce", "Fruits & Légumes", ["courgette", "courgettes"]),
+            Ingredient("Champignons de Paris", "200g", "Fruits & Légumes", ["champignon", "champignons"]),
             Ingredient("Œufs plein air", "4 pièces", "Crèmerie & Fromages", ["oeuf", "oeufs"]),
-            Ingredient("Penne Rigate", "150g", "Épicerie salée", ["penne", "pates", "riz"]),
+            Ingredient("Penne Rigate (placard)", "150g", "Épicerie salée", ["penne", "pates"]),
         ],
-        instructions_brief="Faire sauter les champignons et courgettes à feu vif, cuire les pâtes, accompagner de 2 œufs par personne.",
-        prep_time_min=15,
+        instructions_brief="Faire sauter les champignons émincés 5 min dans la poêle, casser 2 œufs par assiette et accompagner de pâtes.",
+        prep_time_min=10,
+        utensils="1 poêle",
     ),
     Recipe(
-        id="poulet_creme_champignons",
-        title="Émincé de poulet à la crème d'Isigny et champignons, penne",
+        id="saumon_creme_penne",
+        title="Penne crémeuses au saumon fondant et ciboulette",
         ingredients=[
-            Ingredient("Filets de poulet", "250g", "Boucherie & Volaille", ["poulet", "escalope"]),
-            Ingredient("Champignons de Paris", "200g", "Fruits & Légumes", ["champignon", "champignons"]),
+            Ingredient("Pavés de saumon", "2 pièces", "Poissonnerie", ["saumon", "poisson"]),
             Ingredient("Crème fraîche", "15cl", "Crèmerie & Fromages", ["creme", "creme fraiche"]),
-            Ingredient("Penne Rigate", "200g", "Épicerie salée", ["penne", "pates"]),
+            Ingredient("Penne Rigate (placard)", "200g", "Épicerie salée", ["penne", "pates"]),
         ],
-        instructions_brief="Dorer le poulet et les champignons, déglacer et napper de crème, mélanger aux penne.",
-        prep_time_min=20,
+        instructions_brief="Cuire les penne, émietter le saumon poêlé 4 min directement dedans avec la crème fraîche chaude.",
+        prep_time_min=10,
+        utensils="1 casserole",
     ),
+    Recipe(
+        id="dahl_express_lentilles",
+        title="Dahl express de lentilles corail au lait de coco (sur riz)",
+        ingredients=[
+            Ingredient("Lentilles corail", "150g", "Épicerie salée", ["lentilles", "lentille"]),
+            Ingredient("Lait de coco", "20cl", "Épicerie salée", ["coco", "lait de coco"]),
+            Ingredient("Coulis de tomates", "100g", "Épicerie salée", ["coulis de tomates", "coulis"]),
+            Ingredient("Riz basmati (placard)", "150g", "Épicerie salée", ["riz", "basmati"]),
+        ],
+        instructions_brief="Cuire les lentilles 10 min directement dans le lait de coco et le coulis avec curry/sel, servir sur le riz.",
+        prep_time_min=12,
+        utensils="1 casserole",
+    ),
+    Recipe(
+        id="omelette_courgettes_fromage",
+        title="Omelette moelleuse aux courgettes & mozzarella (sur penne)",
+        ingredients=[
+            Ingredient("Œufs plein air", "4 pièces", "Crèmerie & Fromages", ["oeuf", "oeufs"]),
+            Ingredient("Courgettes fraîches", "1 pièce", "Fruits & Légumes", ["courgette", "courgettes"]),
+            Ingredient("Mozzarella di Bufala", "1 boule (125g)", "Crèmerie & Fromages", ["mozzarella", "fromage"]),
+            Ingredient("Penne Rigate (placard)", "150g", "Épicerie salée", ["penne", "pates"]),
+        ],
+        instructions_brief="Râper la courgette à la poêle 3 min, battre les œufs avec les morceaux de mozzarella, cuire 4 min et servir.",
+        prep_time_min=10,
+        utensils="1 poêle",
+    ),
+]
+
+
+# Liste ordonnée de tous les créneaux en duo de la semaine étudiante
+ALL_WEEK_PAIRS: List[Tuple[str, str]] = [
+    ("Lundi soir", "Mardi midi"),      # Index 0
+    ("Mardi soir", "Mercredi midi"),   # Index 1
+    ("Mercredi soir", "Jeudi midi"),   # Index 2
+    ("Jeudi soir", "Vendredi midi"),   # Index 3
 ]
 
 
@@ -159,8 +185,10 @@ class MealSlot:
     meal_type: str  # 'Dîner' ou 'Déjeuner'
     dish_title: str
     is_cooked: bool  # True si préparé ce soir-là, False si réchauffage ou tupperware
-    tupperware_origin: Optional[str] = None  # Nom du repas dont c'est le tupperware
+    tupperware_origin: Optional[str] = None
     notes: str = ""
+    prep_time_min: int = 10
+    utensils: str = ""
 
 
 @dataclass
@@ -172,6 +200,8 @@ class PlannedPreparation:
     lunch_day: str = ""
     is_weekend_item: bool = False
     source_notes: str = ""
+    prep_time_min: int = 10
+    utensils: str = ""
 
 
 @dataclass
@@ -192,27 +222,23 @@ class WeeklyPlan:
     weekend_items_used: List[str]
     promotions_used: List[Dict[str, Any]]
     total_estimated_price: float = 0.0
+    start_day: str = "Lundi soir"
+    pantry_staples_used: List[str] = field(default_factory=list)
 
 
 class MealPlanner:
-    """Orchestrateur de planning hebdomadaire."""
+    """Orchestrateur de planning hebdomadaire avec gestion dynamique des jours restants."""
 
     def __init__(self, promotions: Optional[List[Dict[str, Any]]] = None):
         self.promotions = promotions or []
 
     def parse_user_inventory(self, raw_text: str) -> Tuple[List[str], List[str]]:
-        """Parse le message de l'utilisateur pour extraire les plats cuisinés et les ingrédients bruts.
-
-        Returns:
-            Tuple (plats_prepares, ingredients_bruts)
-        """
-        # Nettoyage des préfixes éventuels de commande Discord
+        """Parse le message pour extraire les plats cuisinés et ingrédients bruts."""
         clean_text = raw_text
         for prefix in ["!planning", "/planning", "planning"]:
             if clean_text.lower().startswith(prefix):
                 clean_text = clean_text[len(prefix):].strip()
 
-        # Suppression des introductions courantes
         clean_text = re.sub(
             r"^(ce week[- ]?end j['’]ai\s*:?|j['’]ai\s*:?|ramene\s*:?|voici\s*:?)",
             "",
@@ -223,7 +249,6 @@ class MealPlanner:
         if not clean_text:
             return [], []
 
-        # Découpage par virgules, retours à la ligne ou tirets
         raw_items = re.split(r"[,;\n\r\+]|(?:\s+et\s+)", clean_text)
         cleaned_items = [it.strip() for it in raw_items if it.strip()]
 
@@ -237,9 +262,15 @@ class MealPlanner:
             "parts de", "traiteur", "portion"
         ]
 
+        # Mots-clés temporels à ignorer dans l'inventaire des aliments
+        day_keywords = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "semaine", "partir de"]
+
         for item in cleaned_items:
             norm = _normalize_text(item)
             if not norm:
+                continue
+            # Ignorer les fragments purement temporels (ex: "à partir de mercredi", "jusqu'à vendredi")
+            if any(dk in norm for dk in day_keywords) and len(norm.split()) <= 4 and not any(k in norm for k in keywords_ready):
                 continue
             if any(k in norm for k in keywords_ready):
                 ready_dishes.append(item)
@@ -247,6 +278,38 @@ class MealPlanner:
                 raw_ingredients.append(item)
 
         return ready_dishes, raw_ingredients
+
+    def detect_start_day_index(
+        self,
+        user_text: str,
+        current_date: Optional[datetime] = None,
+    ) -> int:
+        """Détermine l'index du premier créneau (0=Lundi, 1=Mardi, 2=Mercredi, 3=Jeudi).
+
+        Priorité 1 : Mots-clés explicites dans le texte utilisateur ("mercredi", "jeudi", "mardi", "lundi").
+        Priorité 2 : Jour actuel via datetime.now().
+        """
+        norm_text = _normalize_text(user_text)
+
+        # 1. Analyse textuelle explicite
+        if "mercredi" in norm_text:
+            return 2
+        if "jeudi" in norm_text:
+            return 3
+        if "mardi" in norm_text:
+            return 1
+        if "lundi" in norm_text or "semaine" in norm_text:
+            return 0
+
+        # 2. Détection dynamique selon la date
+        now = current_date or datetime.now()
+        weekday = now.weekday()  # 0: Lundi, 1: Mardi, 2: Mercredi, 3: Jeudi, 4: Vendredi, 5: Samedi, 6: Dimanche
+
+        if weekday in (0, 1, 2, 3):
+            return weekday
+
+        # Du vendredi au dimanche : on planifie par défaut la semaine à venir (Lundi)
+        return 0
 
     def _match_promo_for_ingredient(
         self, ingredient: Ingredient
@@ -262,7 +325,6 @@ class MealPlanner:
         for kw in keywords:
             for promo in self.promotions:
                 p_name = _normalize_text(promo.get("name", ""))
-                # Recherche du mot clé délimité ou sous-chaîne significative
                 if kw in p_name:
                     return promo
         return None
@@ -281,13 +343,17 @@ class MealPlanner:
         norm_inventory = [_normalize_text(it) for it in raw_inventory]
 
         for ing in recipe.ingredients:
-            # Si l'ingrédient est déjà ramené du week-end : gros bonus (économie totale)
+            # Féculents du placard : neutres, ne pénalisent pas
+            if any(s in _normalize_text(ing.name) for s in PANTRY_STAPLES_KEYWORDS):
+                continue
+
+            # Ingrédient déjà rapporté de chez les parents : gros bonus
             keywords = [_normalize_text(k) for k in ing.keywords]
             if any(any(kw in item_inv for kw in keywords) for item_inv in norm_inventory):
                 score += 15.0
                 continue
 
-            # Si l'ingrédient est en promotion chez Monoprix
+            # Promotion Monoprix active
             matched_promo = self._match_promo_for_ingredient(ing)
             if matched_promo:
                 promo_type = matched_promo.get("promo_type", "")
@@ -300,96 +366,100 @@ class MealPlanner:
 
         return score
 
-    def build_plan(self, user_text: str) -> WeeklyPlan:
-        """Génère le planning complet du Lundi soir au Vendredi midi."""
+    def build_plan(
+        self,
+        user_text: str,
+        current_date: Optional[datetime] = None,
+    ) -> WeeklyPlan:
+        """Génère le planning dynamique selon les jours restants et optimise les courses."""
         ready_dishes, raw_inventory = self.parse_user_inventory(user_text)
+
+        # Détermination dynamique du premier jour
+        start_index = self.detect_start_day_index(user_text, current_date=current_date)
+        active_pairs = ALL_WEEK_PAIRS[start_index:]
+
+        if not active_pairs:
+            active_pairs = [ALL_WEEK_PAIRS[-1]]
+
+        start_day_label = active_pairs[0][0]
 
         schedule: List[MealSlot] = []
         preparations: List[PlannedPreparation] = []
         weekend_items_used: List[str] = []
         promotions_used: List[Dict[str, Any]] = []
         all_required_ingredients: List[Ingredient] = []
+        pantry_staples_used: List[str] = []
 
         used_recipe_ids: Set[str] = set()
 
         # -------------------------------------------------------------
-        # ÉTAPE 1 : ÉCOULER LES PLATS ET RESTES DU WEEK-END EN PREMIER
+        # ÉTAPE 1 : ÉCOULER LES PLATS MAISON / RESTES DU WEEK-END EN PREMIER
         # -------------------------------------------------------------
-        # Les plats maison / restes sont placés dès le Lundi soir et Mardi midi
         ready_pool = list(ready_dishes)
+        cooking_slots: List[Tuple[str, str]] = []
 
-        # Gestion Lundi soir
-        if ready_pool:
-            first_dish = ready_pool.pop(0)
-            weekend_items_used.append(first_dish)
-            schedule.append(
-                MealSlot(
-                    day="Lundi soir",
-                    meal_type="Dîner",
-                    dish_title=f"Plat maison du week-end : {first_dish}",
-                    is_cooked=False,
-                    notes="À réchauffer en priorité (fraîcheur maximale)",
-                )
-            )
-
-            # Mardi midi
-            if ready_pool:
-                # Un second plat prêt à l'emploi existe (ex: quiche + poulet rôti)
-                second_dish = ready_pool.pop(0)
-                weekend_items_used.append(second_dish)
+        for idx, (dinner_day, lunch_day) in enumerate(active_pairs):
+            if ready_pool and idx == 0:
+                first_dish = ready_pool.pop(0)
+                weekend_items_used.append(first_dish)
                 schedule.append(
                     MealSlot(
-                        day="Mardi midi",
-                        meal_type="Déjeuner",
-                        dish_title=f"Reste du week-end : {second_dish}",
+                        day=dinner_day,
+                        meal_type="Dîner",
+                        dish_title=f"Plat maison du week-end : {first_dish}",
                         is_cooked=False,
-                        notes="Tupperware maison prêt à emporter / réchauffer",
+                        notes="À réchauffer en priorité (fraîcheur maximale)",
+                        prep_time_min=3,
+                        utensils="Micro-ondes / Casserole",
+                    )
+                )
+
+                if ready_pool:
+                    second_dish = ready_pool.pop(0)
+                    weekend_items_used.append(second_dish)
+                    schedule.append(
+                        MealSlot(
+                            day=lunch_day,
+                            meal_type="Déjeuner",
+                            dish_title=f"Reste du week-end : {second_dish}",
+                            is_cooked=False,
+                            notes="Tupperware maison prêt à emporter (0 min cuisine)",
+                            prep_time_min=0,
+                        )
+                    )
+                else:
+                    schedule.append(
+                        MealSlot(
+                            day=lunch_day,
+                            meal_type="Déjeuner",
+                            dish_title=f"Tupperware maison : {first_dish} (2e part)",
+                            is_cooked=False,
+                            tupperware_origin=dinner_day,
+                            notes="Réchauffage simple au micro-ondes (0 min cuisine)",
+                            prep_time_min=0,
+                        )
+                    )
+
+                preparations.append(
+                    PlannedPreparation(
+                        slot_name="Restes week-end",
+                        recipe_title=first_dish,
+                        portions=2,
+                        dinner_day=dinner_day,
+                        lunch_day=lunch_day,
+                        is_weekend_item=True,
+                        source_notes="Apporté de chez les parents",
+                        prep_time_min=3,
+                        utensils="Micro-ondes",
                     )
                 )
             else:
-                # Même plat s'il contenait 2 parts ou tupperware direct
-                schedule.append(
-                    MealSlot(
-                        day="Mardi midi",
-                        meal_type="Déjeuner",
-                        dish_title=f"Tupperware maison : {first_dish} (2e part)",
-                        is_cooked=False,
-                        tupperware_origin="Lundi soir",
-                        notes="Réchauffage simple au micro-ondes (aucune cuisine le midi)",
-                    )
-                )
-
-            preparations.append(
-                PlannedPreparation(
-                    slot_name="Restes week-end",
-                    recipe_title=first_dish,
-                    portions=2,
-                    dinner_day="Lundi soir",
-                    lunch_day="Mardi midi",
-                    is_weekend_item=True,
-                    source_notes="Apporté de chez les parents",
-                )
-            )
-            # Les dîners à cuisiner seront donc : Mardi soir, Mercredi soir, Jeudi soir
-            cooking_slots = [
-                ("Mardi soir", "Mercredi midi"),
-                ("Mercredi soir", "Jeudi midi"),
-                ("Jeudi soir", "Vendredi midi"),
-            ]
-        else:
-            # Aucun plat tout prêt apporté : il faut cuisiner dès le Lundi soir
-            cooking_slots = [
-                ("Lundi soir", "Mardi midi"),
-                ("Mardi soir", "Mercredi midi"),
-                ("Mercredi soir", "Jeudi midi"),
-                ("Jeudi soir", "Vendredi midi"),
-            ]
+                cooking_slots.append((dinner_day, lunch_day))
 
         # -------------------------------------------------------------
-        # ÉTAPE 2 : SÉLECTIONNER LES RECETTES OPTIMISÉES SELON LES PROMOS
+        # ÉTAPE 2 : SÉLECTIONNER DES RECETTES EXPRESS (< 15 MIN) & PROMOS
         # -------------------------------------------------------------
         for dinner_day, lunch_day in cooking_slots:
-            # Trouver la meilleure recette disponible
             best_recipe: Optional[Recipe] = None
             best_score = -999.0
 
@@ -404,7 +474,7 @@ class MealPlanner:
 
             used_recipe_ids.add(best_recipe.id)
 
-            # Règle des tupperwares : 1 dîner cuisiné = 2 parts
+            # Règle tupperware : 1 dîner préparé = 2 parts (dîner + déjeuner du lendemain)
             schedule.append(
                 MealSlot(
                     day=dinner_day,
@@ -412,6 +482,8 @@ class MealPlanner:
                     dish_title=best_recipe.title,
                     is_cooked=True,
                     notes=f"Cuisiner en DOUBLE portion ({best_recipe.instructions_brief})",
+                    prep_time_min=best_recipe.prep_time_min,
+                    utensils=best_recipe.utensils,
                 )
             )
             schedule.append(
@@ -421,7 +493,8 @@ class MealPlanner:
                     dish_title=f"Tupperware : {best_recipe.title}",
                     is_cooked=False,
                     tupperware_origin=dinner_day,
-                    notes="Reste du dîner de la veille (aucune cuisine le midi)",
+                    notes="Reste de la veille en tupperware — 0 min de cuisine le midi",
+                    prep_time_min=0,
                 )
             )
 
@@ -433,35 +506,49 @@ class MealPlanner:
                     dinner_day=dinner_day,
                     lunch_day=lunch_day,
                     is_weekend_item=False,
-                    source_notes=f"Temps de prépa : ~{best_recipe.prep_time_min} min",
+                    source_notes=f"⏱️ ~{best_recipe.prep_time_min} min | 🍳 {best_recipe.utensils}",
+                    prep_time_min=best_recipe.prep_time_min,
+                    utensils=best_recipe.utensils,
                 )
             )
 
             all_required_ingredients.extend(best_recipe.ingredients)
 
         # -------------------------------------------------------------
-        # ÉTAPE 3 : DÉDUPLICATION & LISTE DE COURSES OPTIMISÉE
+        # ÉTAPE 3 : COURSES SANS FÉCULENTS (PLACARD) & DÉDUPLICATION
         # -------------------------------------------------------------
-        # Ne lister QUE les ingrédients manquants (ceux non apportés par l'utilisateur)
         norm_inventory = [_normalize_text(it) for it in raw_inventory]
         shopping_dict: Dict[str, ShoppingItem] = {}
         total_price = 0.0
 
         for ing in all_required_ingredients:
-            keywords = [_normalize_text(k) for k in ing.keywords] or [_normalize_text(ing.name)]
+            ing_norm = _normalize_text(ing.name)
+            kws = [_normalize_text(k) for k in ing.keywords] or [ing_norm]
 
-            # L'utilisateur l'a-t-il déjà apporté ?
+            # RÈGLE DU PLACARD : Riz et Pâtes sont TOUJOURS en réserve chez l'étudiant
+            is_pantry_staple = any(
+                any(staple in kw for staple in PANTRY_STAPLES_KEYWORDS) for kw in kws
+            ) or any(staple in ing_norm for staple in PANTRY_STAPLES_KEYWORDS)
+
+            if is_pantry_staple:
+                clean_staple_name = ing.name.replace(" (placard)", "")
+                if clean_staple_name not in pantry_staples_used:
+                    pantry_staples_used.append(clean_staple_name)
+                continue  # Ne JAMAIS ajouter le riz ou les pâtes à la liste de courses !
+
+            # L'utilisateur l'a-t-il apporté de chez ses parents ?
             is_brought = False
             for inv_item in norm_inventory:
-                if any(kw in inv_item for kw in keywords):
+                if any(kw in inv_item for kw in kws):
                     is_brought = True
                     if inv_item not in weekend_items_used:
                         weekend_items_used.append(inv_item)
                     break
 
             if is_brought:
-                continue  # Ingrédient déjà disponible gratuitement !
+                continue  # Ingrédient déjà possédé gratuitement
 
+            # Matching des promotions Monoprix
             matched_promo = self._match_promo_for_ingredient(ing)
             if matched_promo:
                 item_name = matched_promo.get("name", ing.name)
@@ -478,7 +565,6 @@ class MealPlanner:
 
             key = _normalize_text(item_name)
             if key in shopping_dict:
-                # L'article est déjà dans la liste de courses, on cumule la mention de quantité
                 existing = shopping_dict[key]
                 if ing.quantity and ing.quantity not in existing.quantity:
                     existing.quantity = f"{existing.quantity} + {ing.quantity}"
@@ -497,7 +583,6 @@ class MealPlanner:
                 base_price=b_price,
             )
 
-        # Tri de la liste de courses par rayon pour faciliter les achats
         sorted_shopping_list = sorted(
             shopping_dict.values(),
             key=lambda item: (item.department, item.name),
@@ -510,4 +595,6 @@ class MealPlanner:
             weekend_items_used=weekend_items_used,
             promotions_used=promotions_used,
             total_estimated_price=round(total_price, 2),
+            start_day=start_day_label,
+            pantry_staples_used=pantry_staples_used,
         )

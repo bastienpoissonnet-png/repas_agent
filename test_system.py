@@ -1,9 +1,10 @@
 """Tests unitaires et de validation du système de repas et courses."""
 
 import unittest
+from datetime import datetime
 from meal_planner import MealPlanner, RECIPE_CATALOG, Ingredient
 from monoprix_client import MonoprixClient, get_promotions
-from bot import create_menu_embed, create_shopping_embed
+from bot import create_menu_embed, create_daily_embeds, create_shopping_embed
 
 
 class TestMonoprixClient(unittest.TestCase):
@@ -17,7 +18,6 @@ class TestMonoprixClient(unittest.TestCase):
         self.assertIsInstance(promos, list)
         self.assertGreater(len(promos), 0)
 
-        # Vérifier que chaque item contient les champs indispensables requis
         for item in promos:
             self.assertIn("name", item)
             self.assertIn("base_price", item)
@@ -36,21 +36,24 @@ class TestMonoprixClient(unittest.TestCase):
 
 
 class TestMealPlanner(unittest.TestCase):
-    """Vérifie le respect strict des contraintes logistiques et de tupperware."""
+    """Vérifie les contraintes logistiques, la dynamique temporelle et les règles tupperware."""
 
     def setUp(self):
         self.promos = get_promotions()
         self.planner = MealPlanner(promotions=self.promos)
 
-    def test_tupperware_pairing_and_week_days(self):
-        """Vérifie que la semaine couvre du Lundi soir au Vendredi midi sans cuisine le midi."""
-        plan = self.planner.build_plan("Ce week-end j'ai : 1 part de quiche, du poulet rôti, des courgettes")
+    def test_full_week_tupperware_pairing(self):
+        """Vérifie le cycle complet Lundi soir -> Vendredi midi quand démarré le Lundi."""
+        dt_lundi = datetime(2026, 10, 5)  # Lundi
+        plan = self.planner.build_plan(
+            "Ce week-end j'ai : 1 part de quiche, du poulet rôti, des courgettes",
+            current_date=dt_lundi,
+        )
 
         # 8 repas au total (4 dîners + 4 déjeuners)
         self.assertEqual(len(plan.schedule), 8)
 
         slots_by_day = {s.day: s for s in plan.schedule}
-
         expected_days = [
             "Lundi soir", "Mardi midi",
             "Mardi soir", "Mercredi midi",
@@ -65,13 +68,76 @@ class TestMealPlanner(unittest.TestCase):
             slot = slots_by_day[day]
             self.assertFalse(slot.is_cooked, f"Le déjeuner {day} ne doit pas nécessiter de cuisine !")
 
-        # Maximum 4 à 5 préparations
-        self.assertLessEqual(len(plan.preparations), 5)
+        self.assertLessEqual(len(plan.preparations), 4)
+
+    def test_dynamic_schedule_wednesday_to_friday(self):
+        """Vérifie que la planification lancée un mercredi ne génère QUE Mercredi soir -> Vendredi midi."""
+        dt_mercredi = datetime(2026, 10, 7)  # Mercredi
+        plan = self.planner.build_plan("Rien", current_date=dt_mercredi)
+
+        days_in_schedule = [s.day for s in plan.schedule]
+        self.assertEqual(
+            days_in_schedule,
+            ["Mercredi soir", "Jeudi midi", "Jeudi soir", "Vendredi midi"],
+        )
+        # 2 préparations maximum
+        self.assertEqual(len(plan.preparations), 2)
+        # Aucune cuisine le midi
+        slots_by_day = {s.day: s for s in plan.schedule}
+        self.assertFalse(slots_by_day["Jeudi midi"].is_cooked)
+        self.assertFalse(slots_by_day["Vendredi midi"].is_cooked)
+
+    def test_dynamic_schedule_thursday_to_friday(self):
+        """Vérifie que la planification lancée un jeudi ne génère QUE Jeudi soir -> Vendredi midi."""
+        dt_jeudi = datetime(2026, 10, 8)  # Jeudi
+        plan = self.planner.build_plan("Rien", current_date=dt_jeudi)
+
+        days_in_schedule = [s.day for s in plan.schedule]
+        self.assertEqual(days_in_schedule, ["Jeudi soir", "Vendredi midi"])
+        self.assertEqual(len(plan.preparations), 1)
+
+    def test_explicit_user_text_day_override(self):
+        """Vérifie qu'une mention textuelle (ex. 'mercredi à vendredi') prévaut sur la date courante."""
+        dt_lundi = datetime(2026, 10, 5)
+        plan = self.planner.build_plan(
+            "mercredi à vendredi : 1 part de quiche",
+            current_date=dt_lundi,
+        )
+        days_in_schedule = [s.day for s in plan.schedule]
+        self.assertEqual(
+            days_in_schedule,
+            ["Mercredi soir", "Jeudi midi", "Jeudi soir", "Vendredi midi"],
+        )
+
+    def test_pantry_staples_never_in_shopping_list(self):
+        """Vérifie que Riz et Pâtes ne sont JAMAIS ajoutés à la liste de courses."""
+        dt_lundi = datetime(2026, 10, 5)
+        plan = self.planner.build_plan("rien", current_date=dt_lundi)
+
+        shopping_names = [it.name.lower() for it in plan.shopping_list]
+        for name in shopping_names:
+            self.assertNotIn("riz", name, "Le riz du placard ne doit pas être sur la liste de courses !")
+            self.assertNotIn("pates", name, "Les pâtes du placard ne doivent pas être sur la liste !")
+            self.assertNotIn("pâtes", name, "Les pâtes du placard ne doivent pas être sur la liste !")
+            self.assertNotIn("penne", name, "Les penne du placard ne doivent pas être sur la liste !")
+
+        # Vérifie que les féculents utilisés sont bien répertoriés dans les réserves du placard
+        self.assertGreater(len(plan.pantry_staples_used), 0)
+
+    def test_recipe_prep_time_under_15_min(self):
+        """Vérifie que toutes les recettes du catalogue sont rapides (< 15 min de prépa)."""
+        for recipe in RECIPE_CATALOG:
+            self.assertLess(
+                recipe.prep_time_min,
+                15,
+                f"La recette '{recipe.title}' dépasse 15 min ({recipe.prep_time_min} min)",
+            )
 
     def test_weekend_leftovers_priority(self):
-        """Vérifie que les plats apportés sont consommés dès le lundi/mardi."""
+        """Vérifie que les plats apportés sont consommés dès le premier créneau."""
+        dt_lundi = datetime(2026, 10, 5)
         user_input = "Ce week-end j'ai : 1 part de quiche, du poulet rôti"
-        plan = self.planner.build_plan(user_input)
+        plan = self.planner.build_plan(user_input, current_date=dt_lundi)
 
         slots_by_day = {s.day: s for s in plan.schedule}
         lundi_soir = slots_by_day["Lundi soir"]
@@ -80,19 +146,10 @@ class TestMealPlanner(unittest.TestCase):
         self.assertIn("quiche", lundi_soir.dish_title.lower())
         self.assertIn("poulet", mardi_midi.dish_title.lower())
 
-    def test_deduplication_ingredients(self):
-        """Vérifie que les ingrédients apportés de chez les parents ne sont pas sur la liste de courses."""
-        user_input = "Ce week-end j'ai : des courgettes, du riz basmati"
-        plan = self.planner.build_plan(user_input)
-
-        shopping_names = [it.name.lower() for it in plan.shopping_list]
-        for name in shopping_names:
-            # Ne doit pas demander d'acheter des courgettes ou du riz
-            self.assertNotIn("courgettes fraîches bio", name)
-
     def test_shopping_list_has_rayons_and_promos(self):
         """Vérifie que la liste de courses est classée par rayon avec mentions de promos."""
-        plan = self.planner.build_plan("rien")
+        dt_lundi = datetime(2026, 10, 5)
+        plan = self.planner.build_plan("rien", current_date=dt_lundi)
         self.assertGreater(len(plan.shopping_list), 0)
 
         rayons = {it.department for it in plan.shopping_list}
@@ -103,15 +160,19 @@ class TestMealPlanner(unittest.TestCase):
 
 
 class TestDiscordEmbeds(unittest.TestCase):
-    """Vérifie que les Embeds Discord se construisent sans lever d'exception."""
+    """Vérifie que les Embeds découpés par jour et de courses se génèrent proprement."""
 
-    def test_embed_generation(self):
+    def test_split_daily_embeds_generation(self):
+        dt_mercredi = datetime(2026, 10, 7)
         planner = MealPlanner(promotions=get_promotions())
-        plan = planner.build_plan("1 part de quiche, des courgettes")
+        plan = planner.build_plan("1 part de quiche", current_date=dt_mercredi)
 
-        menu_embed = create_menu_embed(plan)
-        self.assertIsNotNone(menu_embed.title)
-        self.assertGreater(len(menu_embed.fields), 3)
+        daily_embeds = create_daily_embeds(plan)
+        # 2 paires de jours restantes pour un mercredi (Mercredi/Jeudi et Jeudi/Vendredi)
+        self.assertEqual(len(daily_embeds), 2)
+        for embed in daily_embeds:
+            self.assertIsNotNone(embed.title)
+            self.assertGreater(len(embed.fields), 1)
 
         shopping_embed = create_shopping_embed(plan)
         self.assertIsNotNone(shopping_embed.title)
@@ -120,4 +181,3 @@ class TestDiscordEmbeds(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

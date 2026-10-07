@@ -50,35 +50,26 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 
-def create_menu_embed(plan: WeeklyPlan) -> discord.Embed:
-    """Crée l'Embed Discord pour le planning des repas de la semaine."""
-    embed = discord.Embed(
-        title="🍱 Planning des Repas de la Semaine",
-        description=(
-            "**Du Lundi soir au Vendredi midi**\n"
-            "🔹 **Règle d'or :** Chaque dîner préparé est cuisiné en **double portion** "
-            "pour fournir le tupperware du lendemain midi.\n"
-            "🔹 **Anti-gaspillage :** Priorité absolue aux plats et ingrédients du week-end !"
-        ),
-        color=0xE60012,  # Rouge Monoprix
-    )
+DAY_COLORS = {
+    "lundi": 0x3498DB,      # Bleu
+    "mardi": 0x9B59B6,      # Violet
+    "mercredi": 0xE67E22,   # Orange
+    "jeudi": 0xE74C3C,      # Rouge
+}
 
-    if plan.weekend_items_used:
-        embed.add_field(
-            name="🏠 Restes & Denrées du week-end intégrés",
-            value="• " + "\n• ".join(plan.weekend_items_used),
-            inline=False,
-        )
 
-    # Regroupement par duo (Dîner -> Déjeuner du lendemain)
+def create_daily_embeds(plan: WeeklyPlan) -> List[discord.Embed]:
+    """Génère une liste d'Embeds distincts, un pour chaque duo (Dîner soir & Déjeuner lendemain)."""
+    embeds: List[discord.Embed] = []
+    slots_by_day = {slot.day: slot for slot in plan.schedule}
+
+    # Liste ordonnée de tous les créneaux possibles
     days_order = [
         ("Lundi soir", "Mardi midi"),
         ("Mardi soir", "Mercredi midi"),
         ("Mercredi soir", "Jeudi midi"),
         ("Jeudi soir", "Vendredi midi"),
     ]
-
-    slots_by_day = {slot.day: slot for slot in plan.schedule}
 
     for dinner_day, lunch_day in days_order:
         dinner_slot = slots_by_day.get(dinner_day)
@@ -87,22 +78,55 @@ def create_menu_embed(plan: WeeklyPlan) -> discord.Embed:
         if not dinner_slot or not lunch_slot:
             continue
 
+        day_name = dinner_day.split()[0].lower()
+        color = DAY_COLORS.get(day_name, 0x3498DB)
+
+        embed = discord.Embed(
+            title=f"🗓️ {dinner_day.split()[0]} soir & {lunch_day.split()[0]} midi",
+            color=color,
+        )
+
+        # Dîner
         dinner_icon = "🍳" if dinner_slot.is_cooked else "♨️"
-        dinner_text = f"**{dinner_icon} {dinner_day} (Dîner) :** {dinner_slot.dish_title}"
-        if dinner_slot.notes:
-            dinner_text += f"\n  ↳ *{dinner_slot.notes}*"
+        dinner_prep = f"⏱️ ~{dinner_slot.prep_time_min} min" if dinner_slot.prep_time_min else "Prêt à réchauffer"
+        dinner_utensils = f" | 🍳 {dinner_slot.utensils}" if dinner_slot.utensils else ""
+        dinner_info = (
+            f"**{dinner_slot.dish_title}**\n"
+            f"*{dinner_prep}{dinner_utensils}*\n"
+            f"↳ {dinner_slot.notes}"
+        )
+        embed.add_field(name=f"{dinner_icon} Dîner ({dinner_day})", value=dinner_info, inline=False)
 
-        lunch_icon = "🥡"
-        lunch_text = f"**{lunch_icon} {lunch_day} (Déjeuner) :** {lunch_slot.dish_title}"
-        if lunch_slot.notes:
-            lunch_text += f"\n  ↳ *{lunch_slot.notes}*"
+        # Déjeuner Tupperware
+        lunch_info = (
+            f"**{lunch_slot.dish_title}**\n"
+            f"↳ *{lunch_slot.notes}*"
+        )
+        embed.add_field(name=f"🥡 Déjeuner ({lunch_day})", value=lunch_info, inline=False)
 
-        field_title = f"🗓️ {dinner_day.split()[0]} soir & {lunch_day.split()[0]} midi"
-        field_content = f"{dinner_text}\n{lunch_text}"
+        embed.set_footer(text="Règle Tupperware x2 : double portion le soir = 0 min de cuisine le midi")
+        embeds.append(embed)
 
-        embed.add_field(name=field_title, value=field_content, inline=False)
+    return embeds
 
-    embed.set_footer(text=f"Total préparations à cuisiner : {len(plan.preparations)} | 0 cuisine le midi garanti")
+
+def create_menu_embed(plan: WeeklyPlan) -> discord.Embed:
+    """Embed de synthèse pour rétro-compatibilité."""
+    embed = discord.Embed(
+        title="🍱 Planning des Repas",
+        description=(
+            f"Planning dynamique : **{plan.start_day} ➔ Vendredi midi**\n"
+            "🔹 **Règle d'or :** Chaque dîner préparé compte 2 portions pour le tupperware du lendemain.\n"
+            "🔹 **Anti-gaspillage :** Priorité absolue aux plats du week-end !"
+        ),
+        color=0xE60012,
+    )
+    if plan.weekend_items_used:
+        embed.add_field(
+            name="🏠 Restes du week-end intégrés",
+            value="• " + "\n• ".join(plan.weekend_items_used),
+            inline=False,
+        )
     return embed
 
 
@@ -111,17 +135,24 @@ def create_shopping_embed(plan: WeeklyPlan) -> discord.Embed:
     embed = discord.Embed(
         title="🛒 Liste de Courses Optimisée Monoprix",
         description=(
-            "**Offres Nationales Monoprix** (sans restriction de drive local)\n"
+            f"**Période : {plan.start_day} ➔ Vendredi midi** (Offres Nationales Monoprix)\n"
             "Cette liste ne contient **que les ingrédients manquants** pour vos recettes.\n"
-            "Les promotions ont été priorisées pour réduire votre budget étudiant !"
+            "🌾 *Riz et Pâtes sont déjà dans vos placards (0 € à acheter) !*"
         ),
         color=0x2ECC71,  # Vert économique
     )
 
+    if plan.pantry_staples_used:
+        embed.add_field(
+            name="🌾 Base Placard (Déjà chez vous)",
+            value="• " + "\n• ".join(plan.pantry_staples_used) + "\n*(Non ajoutés au panier Monoprix)*",
+            inline=False,
+        )
+
     if not plan.shopping_list:
         embed.add_field(
             name="🎉 Rien à acheter !",
-            value="Les denrées rapportées de chez vos parents couvrent l'intégralité de la semaine !",
+            value="Vos réserves et les denrées rapportées de chez vos parents couvrent tout !",
             inline=False,
         )
         return embed
@@ -165,7 +196,7 @@ def create_shopping_embed(plan: WeeklyPlan) -> discord.Embed:
 
     summary_text = (
         f"🏷️ **{promo_count} promotions Monoprix** appliquées sur ce panier.\n"
-        f"💰 **Budget de base estimé :** ~{plan.total_estimated_price:.2f} € (avant remises)\n"
+        f"💰 **Budget estimé :** ~{plan.total_estimated_price:.2f} € (avant remises)\n"
         "💡 *Conseil : Pensez à présenter votre carte de fidélité M' Monoprix en caisse.*"
     )
     embed.add_field(name="📊 Bilan Budget & Économies", value=summary_text, inline=False)
@@ -177,20 +208,33 @@ async def generate_and_send_plan(
     channel: discord.abc.Messageable,
     user_inventory_text: str,
 ):
-    """Génère le planning et la liste de courses puis l'envoie sur le salon Discord."""
-    # Récupération asynchrone des promotions nationales Monoprix sans bloquer la boucle d'événements
+    """Génère le planning dynamique et envoie des messages séparés et aérés."""
     loop = asyncio.get_running_loop()
     client = MonoprixClient()
     promotions = await loop.run_in_executor(None, client.get_promotions)
 
-    # Calcul du planning et de la liste de courses
     planner = MealPlanner(promotions=promotions)
     plan = planner.build_plan(user_inventory_text)
 
-    menu_embed = create_menu_embed(plan)
-    shopping_embed = create_shopping_embed(plan)
+    # 1. Message d'en-tête informatif
+    intro_desc = f"Planning optimisé calculé pour : **{plan.start_day} ➔ Vendredi midi**."
+    if plan.weekend_items_used:
+        intro_desc += "\n🏠 **Plats/ingrédients du week-end intégrés :** " + ", ".join(f"`{w}`" for w in plan.weekend_items_used)
 
-    await channel.send(embed=menu_embed)
+    intro_embed = discord.Embed(
+        title="🍱 Votre Organisation des Repas (Express < 15 min)",
+        description=intro_desc,
+        color=0xE60012,
+    )
+    await channel.send(embed=intro_embed)
+
+    # 2. Envoi d'un Embed distinct par jour restant (affichage aéré et lisible)
+    daily_embeds = create_daily_embeds(plan)
+    for daily_embed in daily_embeds:
+        await channel.send(embed=daily_embed)
+
+    # 3. Envoi d'un message séparé pour la liste de courses Monoprix par rayon
+    shopping_embed = create_shopping_embed(plan)
     await channel.send(embed=shopping_embed)
 
 
