@@ -81,7 +81,12 @@ DISCORD_TOKEN=votre_token_discord_ici
 
 # ID numérique du salon Discord dédié aux repas
 DISCORD_CHANNEL_ID=1556984067080327168
+
+# Clé API Google Gemini pour le raisonnement en langage naturel (gemini-2.5-flash)
+GEMINI_API_KEY=votre_cle_gemini_ici
 ```
+
+> 💡 **Moteur IA :** Le planificateur utilise `gemini-2.5-flash` pour comprendre le langage naturel de l'étudiant (ex: *"il me reste 4 oeufs et 3 oignons"*). Si aucune clé n'est fournie, un moteur de règles local prend automatiquement le relais.
 
 > ⚠️ **Important pour Discord :**
 > Dans le **Discord Developer Portal** > votre application > onglet **Bot** :

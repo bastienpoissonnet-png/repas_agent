@@ -1,7 +1,10 @@
 """Tests unitaires et de validation du système de repas et courses."""
 
+import json
 import unittest
 from datetime import datetime
+from unittest.mock import MagicMock, patch
+
 from meal_planner import MealPlanner, RECIPE_CATALOG, Ingredient
 from monoprix_client import MonoprixClient, get_promotions
 from bot import create_menu_embed, create_daily_embeds, create_shopping_embed
@@ -80,9 +83,7 @@ class TestMealPlanner(unittest.TestCase):
             days_in_schedule,
             ["Mercredi soir", "Jeudi midi", "Jeudi soir", "Vendredi midi"],
         )
-        # 2 préparations maximum
         self.assertEqual(len(plan.preparations), 2)
-        # Aucune cuisine le midi
         slots_by_day = {s.day: s for s in plan.schedule}
         self.assertFalse(slots_by_day["Jeudi midi"].is_cooked)
         self.assertFalse(slots_by_day["Vendredi midi"].is_cooked)
@@ -121,7 +122,6 @@ class TestMealPlanner(unittest.TestCase):
             self.assertNotIn("pâtes", name, "Les pâtes du placard ne doivent pas être sur la liste !")
             self.assertNotIn("penne", name, "Les penne du placard ne doivent pas être sur la liste !")
 
-        # Vérifie que les féculents utilisés sont bien répertoriés dans les réserves du placard
         self.assertGreater(len(plan.pantry_staples_used), 0)
 
     def test_recipe_prep_time_under_15_min(self):
@@ -159,6 +159,123 @@ class TestMealPlanner(unittest.TestCase):
         self.assertTrue(has_promo, "Au moins une promotion Monoprix doit être mobilisée")
 
 
+class TestGeminiLLMPlanner(unittest.TestCase):
+    """Vérifie l'intégration du LLM Gemini 2.5 Flash avec appel mocké."""
+
+    @patch("meal_planner.genai.Client")
+    def test_gemini_planner_execution_mocked(self, mock_client_cls):
+        """Vérifie que l'appel à gemini-2.5-flash est correctement construit et parsé."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+
+        mock_response = MagicMock()
+        mock_response.text = json.dumps({
+            "start_day": "Mercredi soir",
+            "schedule": [
+                {
+                    "day": "Mercredi soir",
+                    "meal_type": "Dîner",
+                    "dish_title": "Omelette fondante aux oignons & riz sauté",
+                    "is_cooked": True,
+                    "notes": "Cuisiner en double portion (1 part ce soir, 1 part demain midi)",
+                    "prep_time_min": 10,
+                    "utensils": "1 poêle",
+                },
+                {
+                    "day": "Jeudi midi",
+                    "meal_type": "Déjeuner",
+                    "dish_title": "Tupperware : Omelette fondante aux oignons & riz sauté",
+                    "is_cooked": False,
+                    "tupperware_origin": "Mercredi soir",
+                    "notes": "Tupperware prêt à réchauffer au micro-ondes (0 min cuisine)",
+                    "prep_time_min": 0,
+                    "utensils": "",
+                },
+                {
+                    "day": "Jeudi soir",
+                    "meal_type": "Dîner",
+                    "dish_title": "Poêlée express de poulet fermier aux courgettes",
+                    "is_cooked": True,
+                    "notes": "Cuisiner en double portion",
+                    "prep_time_min": 10,
+                    "utensils": "1 poêle",
+                },
+                {
+                    "day": "Vendredi midi",
+                    "meal_type": "Déjeuner",
+                    "dish_title": "Tupperware : Poêlée express de poulet fermier aux courgettes",
+                    "is_cooked": False,
+                    "tupperware_origin": "Jeudi soir",
+                    "notes": "Tupperware prêt à réchauffer",
+                    "prep_time_min": 0,
+                    "utensils": "",
+                },
+            ],
+            "preparations": [
+                {
+                    "slot_name": "Préparation 1",
+                    "recipe_title": "Omelette fondante aux oignons & riz sauté",
+                    "portions": 2,
+                    "dinner_day": "Mercredi soir",
+                    "lunch_day": "Jeudi midi",
+                    "is_weekend_item": False,
+                    "source_notes": "Valorisation des 4 oeufs et 3 oignons",
+                    "prep_time_min": 10,
+                    "utensils": "1 poêle",
+                },
+                {
+                    "slot_name": "Préparation 2",
+                    "recipe_title": "Poêlée express de poulet fermier aux courgettes",
+                    "portions": 2,
+                    "dinner_day": "Jeudi soir",
+                    "lunch_day": "Vendredi midi",
+                    "is_weekend_item": False,
+                    "source_notes": "Promo Monoprix poulet -30%",
+                    "prep_time_min": 10,
+                    "utensils": "1 poêle",
+                },
+            ],
+            "shopping_list": [
+                {
+                    "name": "Filets de poulet fermier d'Auvergne (500g)",
+                    "department": "Boucherie & Volaille",
+                    "quantity": "250g",
+                    "on_promo": True,
+                    "promo_details": "-30%",
+                    "base_price": 7.45,
+                },
+                {
+                    "name": "Courgettes fraîches bio de France (1kg)",
+                    "department": "Fruits & Légumes",
+                    "quantity": "1 pièce",
+                    "on_promo": True,
+                    "promo_details": "-20%",
+                    "base_price": 2.99,
+                },
+            ],
+            "weekend_items_used": ["4 oeufs", "3 oignons"],
+            "pantry_staples_used": ["Riz basmati"],
+            "total_estimated_price": 10.44,
+        })
+        mock_client.models.generate_content.return_value = mock_response
+
+        planner = MealPlanner(promotions=get_promotions(), api_key="fake_test_gemini_key")
+        plan = planner.build_plan("il me reste 4 oeufs et 3 oignons")
+
+        # Vérification des assertions métier
+        self.assertEqual(len(plan.schedule), 4)
+        self.assertEqual(plan.start_day, "Mercredi soir")
+        self.assertIn("Omelette", plan.schedule[0].dish_title)
+        self.assertFalse(plan.schedule[1].is_cooked, "Le déjeuner du jeudi midi doit être un tupperware")
+        self.assertIn("4 oeufs", plan.weekend_items_used)
+        self.assertEqual(len(plan.preparations), 2)
+
+        # Vérification qu'aucun féculent (riz/pâtes) n'a été inséré dans la liste de courses
+        for item in plan.shopping_list:
+            self.assertNotIn("riz", item.name.lower())
+            self.assertNotIn("pates", item.name.lower())
+
+
 class TestDiscordEmbeds(unittest.TestCase):
     """Vérifie que les Embeds découpés par jour et de courses se génèrent proprement."""
 
@@ -168,7 +285,6 @@ class TestDiscordEmbeds(unittest.TestCase):
         plan = planner.build_plan("1 part de quiche", current_date=dt_mercredi)
 
         daily_embeds = create_daily_embeds(plan)
-        # 2 paires de jours restantes pour un mercredi (Mercredi/Jeudi et Jeudi/Vendredi)
         self.assertEqual(len(daily_embeds), 2)
         for embed in daily_embeds:
             self.assertIsNotNone(embed.title)
