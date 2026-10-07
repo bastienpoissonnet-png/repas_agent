@@ -1,0 +1,23 @@
+# Fichiers sensibles et variables d'environnement
+.env
+.env.local
+.env.*.local
+
+# Environnements virtuels
+.venv/
+venv/
+env/
+ENV/
+
+# Caches Python et compilation
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# OS et éditeurs
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
